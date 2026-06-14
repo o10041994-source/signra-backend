@@ -1,16 +1,25 @@
 import os
-import json
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from groq import Groq
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
-CORS(app)
 
-# Groq client
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Restrict origins in production by setting ALLOWED_ORIGIN env var
+allowed_origin = os.environ.get("ALLOWED_ORIGIN", "*")
+CORS(app, origins=allowed_origin)
 
-# ── Contract generation prompt ──────────────────────────────
+api_key = os.environ.get("GROQ_API_KEY")
+if not api_key:
+    raise RuntimeError("GROQ_API_KEY environment variable is not set")
+
+client = Groq(api_key=api_key)
+
+
 def build_prompt(data):
     trade       = data.get("bizType", "Service Provider")
     contractor  = data.get("contractorName", "Contractor")
@@ -39,14 +48,13 @@ def build_prompt(data):
         "monthly": "Monthly payments due on the 1st of each month."
     }.get(pay_terms, "Full payment due upon completion.")
 
-    return f"""You are a professional contract attorney. Generate a complete, legally sound service agreement.
+    return f"""Generate a complete professional service agreement with the details below.
 
 INSTRUCTIONS:
 - {style_instruction}
-- State: {state} (include state-specific legal clauses where relevant)
-- Trade: {trade}
-- Do NOT include any explanation or preamble — output ONLY the contract document itself
-- Format with clear section headers (1. SCOPE OF WORK, 2. PAYMENT TERMS, etc.)
+- Include state-specific legal clauses for {state} where relevant
+- Output ONLY the contract document — no explanation or preamble
+- Use clear numbered section headers
 - Include signature lines at the end
 
 CONTRACT DETAILS:
@@ -61,7 +69,7 @@ CONTRACT DETAILS:
 - Duration: {duration if duration else "Until project completion"}
 - Special Terms: {special if special else "None"}
 
-Generate a complete professional service agreement with these sections:
+Required sections:
 1. PARTIES
 2. SCOPE OF WORK
 3. PAYMENT TERMS
@@ -70,9 +78,7 @@ Generate a complete professional service agreement with these sections:
 6. LIABILITY LIMITATION
 7. DISPUTE RESOLUTION ({state} law)
 8. SPECIAL PROVISIONS (if any)
-9. SIGNATURES
-
-Make it specific to the {trade} trade and {state} state law."""
+9. SIGNATURES"""
 
 
 @app.route("/", methods=["GET"])
@@ -83,9 +89,14 @@ def home():
 @app.route("/api/generate-contract", methods=["POST"])
 def generate_contract():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
-            return jsonify({"error": "No data provided"}), 400
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+
+        contractor  = (data.get("contractorName") or "").strip()
+        client_name = (data.get("clientName") or "").strip()
+        if not contractor or not client_name:
+            return jsonify({"error": "contractorName and clientName are required"}), 400
 
         prompt = build_prompt(data)
 
@@ -102,7 +113,7 @@ def generate_contract():
                 }
             ],
             temperature=0.3,
-            max_tokens=2000,
+            max_tokens=4096,
         )
 
         contract_text = completion.choices[0].message.content
@@ -116,7 +127,8 @@ def generate_contract():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error("Contract generation failed: %s", e)
+        return jsonify({"error": "Failed to generate contract. Please try again."}), 500
 
 
 @app.route("/api/health", methods=["GET"])
