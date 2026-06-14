@@ -284,18 +284,41 @@ def generate():
     finally:
         db.close()
 
+    contract_type = data.get('type', 'Service Agreement')
+
+    # Build type-specific details block
+    extra_details = ""
+    if contract_type == "Employment Contract":
+        extra_details = f"""Job Title / Position: {data.get('role','')}
+Employment Type: {data.get('employmentType','Full-time')}
+Probation Period: {data.get('probation','') or 'Not specified'}
+Salary / Wage: {data.get('currency','USD')} {data.get('price','')}
+Pay Frequency: {data.get('payFrequency','')}"""
+    elif contract_type == "NDA":
+        extra_details = f"""NDA Type: {data.get('ndaType','Mutual')}
+Confidentiality Duration: {data.get('duration','')}
+(This is an NDA — do not include payment/price sections unless explicitly mentioned in notes.)"""
+    elif contract_type == "Freelance / Contractor":
+        extra_details = f"""Project Fee: {data.get('currency','USD')} {data.get('price','')} — {data.get('paymentTerms','')}
+Revisions Included: {data.get('revisions','') or 'Not specified'}
+Intellectual Property: {data.get('ip','Transfers to Client on final payment')}"""
+    else:  # Service Agreement / Custom
+        extra_details = f"""Payment: {data.get('currency','USD')} {data.get('price','')} — {data.get('paymentTerms','')}
+Service Frequency: {data.get('frequency','One-time') or 'One-time'}"""
+
     prompt = f"""You are a professional contract writer for US small businesses.
-Write a complete, professional {data.get('type','Service Agreement')} contract.
+Write a complete, professional {contract_type} contract.
 
 Style: {data.get('style','Formal')}
-Party A (Contractor): {data.get('partyA','')} — {data.get('locationA','')}
-Party B (Client): {data.get('partyB','')} — {data.get('locationB','')}
-Scope of work: {data.get('scope','')}
-Payment: {data.get('currency','USD')} {data.get('price','')} — {data.get('paymentTerms','')}
+Party A (Contractor/Employer): {data.get('partyA','')} — {data.get('locationA','')}
+Party B (Client/Employee): {data.get('partyB','')} — {data.get('locationB','')}
+Scope of work / Job description: {data.get('scope','')}
+{extra_details}
 Additional notes: {data.get('notes','')}
 
-Write a complete, numbered contract with all standard clauses, signature blocks at the end,
-and a short disclaimer that Signra is not a law firm and this is not legal advice."""
+Write a complete, numbered contract with all standard clauses appropriate for a {contract_type},
+signature blocks at the end, and a short disclaimer that Signra is not a law firm and this is not legal advice.
+Use the type-specific details above to fill in the relevant sections accurately."""
 
     if not GROQ_API_KEY:
         return jsonify({"error": "AI key not configured on the server"}), 500
