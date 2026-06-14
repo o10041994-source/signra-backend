@@ -22,6 +22,7 @@ CORS(app, supports_credentials=True, origins="*")
 SECRET_KEY   = os.environ.get("SECRET_KEY", "change-this-secret-key-please")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL   = "llama-3.3-70b-versatile"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 # ── ADMIN ─────────────────────────────────────────────────
 # Any email listed here gets unlimited everything for free.
@@ -165,6 +166,62 @@ def signin():
 
         # Upgrade admin in DB if not already set
         if is_admin(user.email) and user.plan != "admin":
+            user.plan = "admin"
+            db.commit()
+
+        token = make_token(user.id)
+        return jsonify({
+            "token": token,
+            "user": {
+                "id":    user.id,
+                "name":  user.name,
+                "email": user.email,
+                "plan":  get_user_plan(user),
+                "admin": is_admin(user.email),
+            },
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/google-auth", methods=["POST"])
+def google_auth():
+    """Sign in or sign up using a Google account."""
+    data = request.get_json()
+    credential = data.get("credential", "")
+    if not credential:
+        return jsonify({"error": "Missing Google credential"}), 400
+
+    # Verify the token with Google's servers
+    try:
+        r = requests.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": credential},
+            timeout=10,
+        )
+        r.raise_for_status()
+        info = r.json()
+    except Exception:
+        return jsonify({"error": "Could not verify Google account"}), 400
+
+    if GOOGLE_CLIENT_ID and info.get("aud") != GOOGLE_CLIENT_ID:
+        return jsonify({"error": "Google login not configured correctly"}), 400
+
+    email = (info.get("email") or "").strip().lower()
+    name  = info.get("name") or email.split("@")[0]
+    if not email:
+        return jsonify({"error": "Google account has no email"}), 400
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(email=email).first()
+        if not user:
+            plan = "admin" if is_admin(email) else "free"
+            user = User(name=name, email=email, password_hash="", plan=plan)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        elif is_admin(email) and user.plan != "admin":
             user.plan = "admin"
             db.commit()
 
