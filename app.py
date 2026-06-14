@@ -306,6 +306,19 @@ Intellectual Property: {data.get('ip','Transfers to Client on final payment')}""
         extra_details = f"""Payment: {data.get('currency','USD')} {data.get('price','')} — {data.get('paymentTerms','')}
 Service Frequency: {data.get('frequency','One-time') or 'One-time'}"""
 
+    if plan == "free":
+        disclaimer_instruction = (
+            'a final line that reads exactly: "Generated with Signra \u2014 signra.net. '
+            'This document does not constitute legal advice and should be reviewed by a '
+            'qualified professional before use."'
+        )
+    else:
+        disclaimer_instruction = (
+            'a short, brand-neutral disclaimer noting that this document does not constitute '
+            'legal advice and should be reviewed by a qualified professional before use. '
+            'Do NOT mention Signra, signra.net, or any generator/tool name anywhere in the document.'
+        )
+
     prompt = f"""You are a professional contract writer for US small businesses.
 Write a complete, professional {contract_type} contract.
 
@@ -317,7 +330,7 @@ Scope of work / Job description: {data.get('scope','')}
 Additional notes: {data.get('notes','')}
 
 Write a complete, numbered contract with all standard clauses appropriate for a {contract_type},
-signature blocks at the end, and a short disclaimer that Signra is not a law firm and this is not legal advice.
+signature blocks at the end, and {disclaimer_instruction}
 Use the type-specific details above to fill in the relevant sections accurately."""
 
     if not GROQ_API_KEY:
