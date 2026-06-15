@@ -12,7 +12,7 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, func
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 import requests
 
@@ -66,6 +66,26 @@ class Contract(Base):
     owner      = relationship("User", back_populates="contracts")
 
 
+class Event(Base):
+    __tablename__ = "events"
+    id         = Column(Integer, primary_key=True)
+    type       = Column(String(40))   # 'pageview', 'contract_generated', 'pdf_tool'
+    name       = Column(String(120))  # page name / contract type / tool name
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id         = Column(Integer, primary_key=True)
+    user_id    = Column(Integer, ForeignKey("users.id"), nullable=True)
+    name       = Column(String(120))
+    email      = Column(String(120))
+    category   = Column(String(60))
+    message    = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -99,6 +119,29 @@ def get_user_plan(user):
     if is_admin(user.email):
         return "admin"
     return user.plan
+
+
+def optional_user_id():
+    """Returns user_id from token if present and valid, else None. Never raises."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    try:
+        data = jwt.decode(auth.split(" ", 1)[1], SECRET_KEY, algorithms=["HS256"])
+        return data.get("user_id")
+    except Exception:
+        return None
+
+
+def log_event(event_type, name, user_id=None):
+    db = SessionLocal()
+    try:
+        db.add(Event(type=event_type, name=(name or "")[:120], user_id=user_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 # ── ROUTES ────────────────────────────────────────────────
@@ -264,6 +307,39 @@ def me():
         db.close()
 
 
+@app.route("/api/track", methods=["POST"])
+def track_event():
+    """Fire-and-forget analytics: pageviews, pdf tool usage, etc."""
+    data = request.get_json(silent=True) or {}
+    event_type = data.get("type", "pageview")
+    name = data.get("name", "")
+    if event_type not in ("pageview", "pdf_tool"):
+        return jsonify({"ok": False}), 400
+    log_event(event_type, name, optional_user_id())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/feedback", methods=["POST"])
+def submit_feedback():
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "Message is required"}), 400
+    db = SessionLocal()
+    try:
+        db.add(Feedback(
+            user_id=optional_user_id(),
+            name=(data.get("name") or "")[:120],
+            email=(data.get("email") or "")[:120],
+            category=(data.get("category") or "General")[:60],
+            message=message,
+        ))
+        db.commit()
+    finally:
+        db.close()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/generate", methods=["POST"])
 @login_required
 def generate():
@@ -355,6 +431,7 @@ Use the type-specific details above to fill in the relevant sections accurately.
     except Exception as e:
         return jsonify({"error": f"AI generation failed: {str(e)}"}), 500
 
+    log_event("contract_generated", contract_type, request.user_id)
     return jsonify({"contract": contract_text})
 
 
@@ -462,6 +539,110 @@ def admin_set_plan():
         user.plan = plan
         db.commit()
         return jsonify({"message": f"{email} is now on the {plan} plan"})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/stats", methods=["GET"])
+@login_required
+def admin_stats():
+    db = SessionLocal()
+    try:
+        me = db.get(User, request.user_id)
+        if not is_admin(me.email):
+            return jsonify({"error": "Admin only"}), 403
+
+        total_users = db.query(User).count()
+        pro_users   = db.query(User).filter(User.plan.in_(["pro", "admin", "business"])).count()
+        free_users  = total_users - pro_users
+
+        total_contracts = db.query(Contract).filter_by(status="done").count()
+        total_drafts     = db.query(Contract).filter_by(status="draft").count()
+
+        contracts_by_type = dict(
+            db.query(Event.name, func.count(Event.id))
+              .filter(Event.type == "contract_generated")
+              .group_by(Event.name)
+              .order_by(func.count(Event.id).desc())
+              .all()
+        )
+
+        pageviews_by_page = dict(
+            db.query(Event.name, func.count(Event.id))
+              .filter(Event.type == "pageview")
+              .group_by(Event.name)
+              .order_by(func.count(Event.id).desc())
+              .all()
+        )
+        total_pageviews = sum(pageviews_by_page.values())
+
+        pdf_tool_usage = dict(
+            db.query(Event.name, func.count(Event.id))
+              .filter(Event.type == "pdf_tool")
+              .group_by(Event.name)
+              .order_by(func.count(Event.id).desc())
+              .all()
+        )
+
+        feedback_count = db.query(Feedback).count()
+
+        # Signups in the last 30 days, grouped by date
+        thirty_days_ago = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+        signups_recent = (
+            db.query(func.date(User.created_at), func.count(User.id))
+              .filter(User.created_at >= thirty_days_ago)
+              .group_by(func.date(User.created_at))
+              .order_by(func.date(User.created_at))
+              .all()
+        )
+        signups_by_day = {str(d): n for d, n in signups_recent}
+
+        return jsonify({
+            "users": {
+                "total": total_users,
+                "free": free_users,
+                "pro": pro_users,
+            },
+            "contracts": {
+                "total_done": total_contracts,
+                "total_drafts": total_drafts,
+                "by_type": contracts_by_type,
+            },
+            "pageviews": {
+                "total": total_pageviews,
+                "by_page": pageviews_by_page,
+            },
+            "pdf_tools": {
+                "by_tool": pdf_tool_usage,
+                "total": sum(pdf_tool_usage.values()),
+            },
+            "feedback_count": feedback_count,
+            "signups_by_day": signups_by_day,
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/feedback", methods=["GET"])
+@login_required
+def admin_feedback():
+    db = SessionLocal()
+    try:
+        me = db.get(User, request.user_id)
+        if not is_admin(me.email):
+            return jsonify({"error": "Admin only"}), 403
+        rows = db.query(Feedback).order_by(Feedback.created_at.desc()).limit(200).all()
+        return jsonify({"feedback": [
+            {
+                "id": f.id,
+                "name": f.name,
+                "email": f.email,
+                "category": f.category,
+                "message": f.message,
+                "created_at": f.created_at.strftime("%d %b %Y %H:%M"),
+            }
+            for f in rows
+        ]})
     finally:
         db.close()
 
