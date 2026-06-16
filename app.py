@@ -589,10 +589,10 @@ def admin_stats():
         # Signups in the last 30 days, grouped by date
         thirty_days_ago = datetime.datetime.utcnow() - datetime.timedelta(days=30)
         signups_recent = (
-            db.query(func.date(User.created_at), func.count(User.id))
+            db.query(func.strftime('%Y-%m-%d', User.created_at), func.count(User.id))
               .filter(User.created_at >= thirty_days_ago)
-              .group_by(func.date(User.created_at))
-              .order_by(func.date(User.created_at))
+              .group_by(func.strftime('%Y-%m-%d', User.created_at))
+              .order_by(func.strftime('%Y-%m-%d', User.created_at))
               .all()
         )
         signups_by_day = {str(d): n for d, n in signups_recent}
