@@ -25,13 +25,35 @@ GROQ_MODEL   = "llama-3.3-70b-versatile"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 # ── ADMIN ─────────────────────────────────────────────────
-# Any email listed here gets unlimited everything for free.
-ADMIN_EMAILS = {
-    "omar050411@gmail.com",   # Omar — full admin
-}
+# The owner email always has full admin access regardless of DB state.
+# Other admins are granted via the AdminAccess table (invite system).
+OWNER_EMAIL = "omar050411@gmail.com"
+ADMIN_EMAILS = {OWNER_EMAIL}  # kept for backward compatibility with get_user_plan()
 
 def is_admin(email):
-    return (email or "").strip().lower() in ADMIN_EMAILS
+    email = (email or "").strip().lower()
+    if email == OWNER_EMAIL:
+        return True
+    db = SessionLocal()
+    try:
+        rec = db.query(AdminAccess).filter_by(email=email, status="active").first()
+        return rec is not None
+    except Exception:
+        return False
+    finally:
+        db.close()
+
+
+def get_admin_role(email):
+    email = (email or "").strip().lower()
+    if email == OWNER_EMAIL:
+        return "owner"
+    db = SessionLocal()
+    try:
+        rec = db.query(AdminAccess).filter_by(email=email, status="active").first()
+        return rec.role if rec else None
+    finally:
+        db.close()
 
 # ── DATABASE ──────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///signra.db")
@@ -84,6 +106,18 @@ class Feedback(Base):
     category   = Column(String(60))
     message    = Column(Text)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class AdminAccess(Base):
+    """Tracks who has admin-level access to the Signra admin panel, beyond the hardcoded owner."""
+    __tablename__ = "admin_access"
+    id          = Column(Integer, primary_key=True)
+    email       = Column(String(120), unique=True, nullable=False)
+    role        = Column(String(20), default="admin")   # 'admin', 'support', 'analyst'
+    status      = Column(String(20), default="pending")  # 'pending', 'active', 'revoked'
+    invited_by  = Column(String(120))
+    invited_at  = Column(DateTime, default=datetime.datetime.utcnow)
+    accepted_at = Column(DateTime, nullable=True)
 
 
 Base.metadata.create_all(engine)
@@ -167,6 +201,13 @@ def signup():
         if db.query(User).filter_by(email=email).first():
             return jsonify({"error": "An account with this email already exists"}), 400
 
+        # If this email has a pending admin invite, activate it now
+        invite = db.query(AdminAccess).filter_by(email=email, status="pending").first()
+        if invite:
+            invite.status = "active"
+            invite.accepted_at = datetime.datetime.utcnow()
+            db.commit()
+
         # Admin email automatically gets the 'admin' plan in the DB too
         plan = "admin" if is_admin(email) else "free"
 
@@ -206,6 +247,13 @@ def signin():
         user = db.query(User).filter_by(email=email).first()
         if not user or not check_password_hash(user.password_hash, password):
             return jsonify({"error": "Wrong email or password"}), 401
+
+        # Activate any pending admin invite for this email
+        invite = db.query(AdminAccess).filter_by(email=email, status="pending").first()
+        if invite:
+            invite.status = "active"
+            invite.accepted_at = datetime.datetime.utcnow()
+            db.commit()
 
         # Upgrade admin in DB if not already set
         if is_admin(user.email) and user.plan != "admin":
@@ -257,6 +305,13 @@ def google_auth():
 
     db = SessionLocal()
     try:
+        # Activate any pending admin invite for this email
+        invite = db.query(AdminAccess).filter_by(email=email, status="pending").first()
+        if invite:
+            invite.status = "active"
+            invite.accepted_at = datetime.datetime.utcnow()
+            db.commit()
+
         user = db.query(User).filter_by(email=email).first()
         if not user:
             plan = "admin" if is_admin(email) else "free"
@@ -643,6 +698,116 @@ def admin_feedback():
             }
             for f in rows
         ]})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/access", methods=["GET"])
+@login_required
+def admin_access_list():
+    """List everyone with admin-level access: the owner plus all invited admins."""
+    db = SessionLocal()
+    try:
+        me = db.get(User, request.user_id)
+        if not is_admin(me.email):
+            return jsonify({"error": "Admin only"}), 403
+
+        rows = db.query(AdminAccess).order_by(AdminAccess.invited_at.desc()).all()
+        admins = [{
+            "id": None,
+            "email": OWNER_EMAIL,
+            "role": "owner",
+            "status": "active",
+            "invited_by": None,
+            "invited_at": None,
+        }]
+        for r in rows:
+            admins.append({
+                "id": r.id,
+                "email": r.email,
+                "role": r.role,
+                "status": r.status,
+                "invited_by": r.invited_by,
+                "invited_at": r.invited_at.strftime("%d %b %Y") if r.invited_at else None,
+            })
+        return jsonify({"admins": admins})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/access/invite", methods=["POST"])
+@login_required
+def admin_access_invite():
+    """Grant admin access to a new email. Only the owner can do this."""
+    db = SessionLocal()
+    try:
+        me = db.get(User, request.user_id)
+        if me.email.strip().lower() != OWNER_EMAIL:
+            return jsonify({"error": "Only the account owner can grant admin access"}), 403
+
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        role = (data.get("role") or "admin").strip().lower()
+
+        if not email or "@" not in email:
+            return jsonify({"error": "Valid email is required"}), 400
+        if role not in ("admin", "support", "analyst"):
+            return jsonify({"error": "Invalid role"}), 400
+        if email == OWNER_EMAIL:
+            return jsonify({"error": "This email is already the owner"}), 400
+
+        existing = db.query(AdminAccess).filter_by(email=email).first()
+        if existing and existing.status == "active":
+            return jsonify({"error": "This email already has admin access"}), 400
+
+        if existing:
+            existing.role = role
+            existing.status = "pending"
+            existing.invited_by = me.email
+            existing.invited_at = datetime.datetime.utcnow()
+        else:
+            db.add(AdminAccess(email=email, role=role, status="pending", invited_by=me.email))
+
+        # If a user account already exists for this email, activate immediately
+        target_user = db.query(User).filter_by(email=email).first()
+        if target_user:
+            rec = db.query(AdminAccess).filter_by(email=email).first()
+            db.commit()
+            rec.status = "active"
+            rec.accepted_at = datetime.datetime.utcnow()
+            if target_user.plan != "admin":
+                target_user.plan = "admin"
+
+        db.commit()
+        return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/access/revoke", methods=["POST"])
+@login_required
+def admin_access_revoke():
+    """Revoke a previously granted admin's access. Only the owner can do this."""
+    db = SessionLocal()
+    try:
+        me = db.get(User, request.user_id)
+        if me.email.strip().lower() != OWNER_EMAIL:
+            return jsonify({"error": "Only the account owner can revoke admin access"}), 403
+
+        data = request.get_json(silent=True) or {}
+        access_id = data.get("id")
+        rec = db.get(AdminAccess, access_id) if access_id else None
+        if not rec:
+            return jsonify({"error": "Admin record not found"}), 404
+
+        rec.status = "revoked"
+
+        target_user = db.query(User).filter_by(email=rec.email).first()
+        if target_user and target_user.plan == "admin":
+            target_user.plan = "free"
+
+        db.commit()
+        return jsonify({"ok": True})
     finally:
         db.close()
 
